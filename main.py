@@ -192,27 +192,41 @@ def process():
     doc_ref = extract_doc_ref(body)
     if not doc_ref:
         return {
-            "ok": False,
-            "error": "missing_doc_ref",
+            "ok": True,
+            "skipped": True,
+            "reason": "missing_doc_ref",
             "event_type": event_type,
             "paytraq_forward": paytraq_forward,
-        }, 400
+        }, 200
 
     mapping = fetch_mapping(doc_ref)
     if not mapping:
         return {
-            "ok": False,
-            "error": "mapping_not_found",
+            "ok": True,
+            "skipped": True,
+            "reason": "mapping_not_found",
             "doc_ref": doc_ref,
             "event_type": event_type,
             "paytraq_forward": paytraq_forward,
-        }, 404
+        }, 200
 
     deal_id = mapping["pipedrive_deal_id"]
-    order = fetch_mozello_order(doc_ref)
-    deal = fetch_pipedrive_deal(deal_id)
-    payload = build_payload(order, deal)
-    result = update_deal(deal_id, payload)
+
+    try:
+        order = fetch_mozello_order(doc_ref)
+        deal = fetch_pipedrive_deal(deal_id)
+        payload = build_payload(order, deal)
+        result = update_deal(deal_id, payload)
+    except Exception as e:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": f"post_forward_processing_failed: {e}",
+            "doc_ref": doc_ref,
+            "deal_id": deal_id,
+            "event_type": event_type,
+            "paytraq_forward": paytraq_forward,
+        }, 200
 
     return {
         "ok": True,
@@ -222,7 +236,7 @@ def process():
         "paytraq_forward": paytraq_forward,
         "payload": payload,
         "pipedrive_response": result,
-    }
+    }, 200
 
 
 if __name__ == "__main__":
