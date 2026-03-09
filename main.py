@@ -1,5 +1,6 @@
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict
+from datetime import datetime
 
 import requests
 from flask import Flask, request, jsonify
@@ -11,9 +12,13 @@ MOZELLO_MAP_COLLECTION = os.getenv("MOZELLO_MAP_COLLECTION", "mozello_deal_map")
 PIPEDRIVE_API_TOKEN = os.getenv("PIPEDRIVE_API_TOKEN")
 PIPEDRIVE_BASE_URL = os.getenv("PIPEDRIVE_BASE_URL", "https://api.pipedrive.com").rstrip("/")
 
-# Deal field keys
-PD_FIELD_MOZELLO_PAYMENT_METHOD = "481737790ef7c52078ce5455742c0a0ad32a0f8e"
-PD_FIELD_MOZELLO_PAYMENT_STATUS = "990cd54bfc733795ffc5888156053301245261b7"
+# Pipedrive fields
+PD_FIELD_PAYMENT_METHOD = "481737790ef7c52078ce5455742c0a0ad32a0f8e"
+PD_FIELD_PAYMENT_STATUS = "990cd54bfc733795ffc5888156053301245261b7"
+PD_FIELD_SHIPPING_METHOD = "7f74e6eca96c93d5ecc3cda935f6cf3ead9a60fb"
+PD_FIELD_TRACKING_URL = "fa93f8d95879ea0c0a92f99d9a84fe125e79d3ff"
+PD_FIELD_TRACKING_CODE = "2422006d4620be8a343499abdece3bc9fe6f5b14"
+PD_FIELD_DISPATCH_DATE = "e98a18db6058dca682dd00f3161f665b4b739e88"
 
 app = Flask(__name__)
 
@@ -22,7 +27,15 @@ def _pt(v: Any) -> str:
     return (str(v) if v is not None else "").strip()
 
 
-def _json_or_form_body() -> Dict[str, Any]:
+def _pd_params():
+    return {"api_token": PIPEDRIVE_API_TOKEN}
+
+
+def _pd_url(path: str):
+    return f"{PIPEDRIVE_BASE_URL}{path}"
+
+
+def _json_or_form_body():
     data = request.get_json(silent=True)
     if isinstance(data, dict):
         return data
@@ -33,219 +46,145 @@ def _json_or_form_body() -> Dict[str, Any]:
     return {}
 
 
-def _extract_doc_ref(body: Dict[str, Any]) -> str:
-    # 1) direct internal call
-    doc_ref = _pt(body.get("doc_ref"))
-    if doc_ref:
-        return doc_ref
+def extract_doc_ref(body: Dict[str, Any]):
 
-    # 2) Mozello payment trigger docs use invoice_id in POST
-    #    invoice_id is like M-860325-30568
-    invoice_id = _pt(body.get("invoice_id"))
-    if invoice_id:
-        return invoice_id
-
-    # fallback names just in case
-    for key in ("order_id", "document_ref", "docId", "invoiceId"):
-        v = _pt(body.get(key))
+    for k in ("doc_ref", "invoice_id", "order_id"):
+        v = _pt(body.get(k))
         if v:
             return v
+
+    if isinstance(body.get("order"), dict):
+        return _pt(body["order"].get("order_id"))
+
+    if isinstance(body.get("data"), dict):
+        return _pt(body["data"].get("order_id"))
 
     return ""
 
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok"})
+def fetch_mozello_order(doc_ref: str):
 
-
-def fetch_mozello_order(doc_ref: str) -> Dict[str, Any]:
     url = f"https://api.mozello.com/v1/store/order/{doc_ref}/"
-    headers = {"Authorization": f"ApiKey {MOZELLO_API_KEY}"}
 
-    r = requests.get(url, headers=headers, timeout=20)
+    r = requests.get(
+        url,
+        headers={"Authorization": f"ApiKey {MOZELLO_API_KEY}"},
+        timeout=20,
+    )
 
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw_text": r.text}
-
-    return {
-        "http_status": r.status_code,
-        "data": data,
-    }
+    return r.json()
 
 
-def fetch_mozello_mapping(doc_ref: str) -> Dict[str, Any]:
+def fetch_mapping(doc_ref: str):
+
     db = firestore.Client()
+
     snap = db.collection(MOZELLO_MAP_COLLECTION).document(doc_ref).get()
 
     if not snap.exists:
-        return {
-            "found": False,
-            "doc_ref": doc_ref,
-            "collection": MOZELLO_MAP_COLLECTION,
-            "data": None,
-        }
+        return None
 
-    data = snap.to_dict() or {}
-    return {
-        "found": True,
-        "doc_ref": doc_ref,
-        "collection": MOZELLO_MAP_COLLECTION,
-        "data": data,
-    }
+    return snap.to_dict()
 
 
-def _pd_params() -> Dict[str, str]:
-    if not PIPEDRIVE_API_TOKEN:
-        raise RuntimeError("missing PIPEDRIVE_API_TOKEN")
-    return {"api_token": PIPEDRIVE_API_TOKEN}
+def fetch_pipedrive_deal(deal_id):
+
+    r = requests.get(
+        _pd_url(f"/v1/deals/{deal_id}"),
+        params=_pd_params(),
+        timeout=20,
+    )
+
+    return r.json()["data"]
 
 
-def _pd_url(path: str) -> str:
-    return f"{PIPEDRIVE_BASE_URL}{path}"
+def build_payload(order, deal):
 
+    payload = {}
 
-def build_payment_update_payload(mozello_order: Dict[str, Any]) -> Dict[str, Any]:
-    data = mozello_order.get("data") or {}
+    payment_method = _pt(order.get("payment_method_details"))
+    payment_status = _pt(order.get("payment_status"))
+    shipping_method = _pt(order.get("shipping_method"))
+    tracking_url = _pt(order.get("shipping_tracking_url"))
+    tracking_code = _pt(order.get("shipping_tracking_code"))
 
-    payment_method = _pt(data.get("payment_method_details")) or _pt(data.get("payment_method"))
-    payment_status = _pt(data.get("payment_status"))
+    if deal.get(PD_FIELD_PAYMENT_METHOD) != payment_method:
+        payload[PD_FIELD_PAYMENT_METHOD] = payment_method
 
-    payload: Dict[str, Any] = {}
+    if deal.get(PD_FIELD_PAYMENT_STATUS) != payment_status:
+        payload[PD_FIELD_PAYMENT_STATUS] = payment_status
 
-    if payment_method:
-        payload[PD_FIELD_MOZELLO_PAYMENT_METHOD] = payment_method
+    if deal.get(PD_FIELD_SHIPPING_METHOD) != shipping_method:
+        payload[PD_FIELD_SHIPPING_METHOD] = shipping_method
 
-    if payment_status:
-        payload[PD_FIELD_MOZELLO_PAYMENT_STATUS] = payment_status
+    if deal.get(PD_FIELD_TRACKING_URL) != tracking_url:
+        payload[PD_FIELD_TRACKING_URL] = tracking_url
+
+    if deal.get(PD_FIELD_TRACKING_CODE) != tracking_code:
+        payload[PD_FIELD_TRACKING_CODE] = tracking_code
+
+    if order.get("dispatched") is True:
+
+        today = datetime.utcnow().date().isoformat()
+
+        if deal.get(PD_FIELD_DISPATCH_DATE) != today:
+            payload[PD_FIELD_DISPATCH_DATE] = today
 
     return payload
 
 
-def update_pipedrive_deal(deal_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
+def update_deal(deal_id, payload):
+
     if not payload:
-        return {
-            "ok": True,
-            "skipped": True,
-            "reason": "empty_payload",
-            "deal_id": deal_id,
-            "payload": {},
-        }
+        return {"ok": True, "skipped": True}
 
-    url = _pd_url(f"/v1/deals/{deal_id}")
-    r = requests.put(url, params=_pd_params(), json=payload, timeout=30)
+    r = requests.put(
+        _pd_url(f"/v1/deals/{deal_id}"),
+        params=_pd_params(),
+        json=payload,
+        timeout=30,
+    )
 
-    try:
-        data = r.json()
-    except Exception:
-        data = {"raw_text": r.text}
+    return r.json()
 
-    return {
-        "ok": r.ok,
-        "http_status": r.status_code,
-        "deal_id": deal_id,
-        "payload": payload,
-        "response": data,
-    }
+
+@app.route("/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.route("/process", methods=["POST"])
 def process():
+
     body = _json_or_form_body()
-    doc_ref = _extract_doc_ref(body)
+
+    doc_ref = extract_doc_ref(body)
 
     if not doc_ref:
-        return jsonify({
-            "ok": False,
-            "error": "missing doc_ref_or_invoice_id",
-            "received_keys": sorted(list(body.keys()))
-        }), 400
+        return {"ok": False, "error": "missing_doc_ref"}, 400
 
-    if not MOZELLO_API_KEY:
-        return jsonify({"ok": False, "error": "missing MOZELLO_API_KEY"}), 500
+    mapping = fetch_mapping(doc_ref)
 
-    try:
-        mapping_result = fetch_mozello_mapping(doc_ref)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "error": f"firestore_mapping_read_failed: {e}"
-        }), 500
+    if not mapping:
+        return {"ok": False, "error": "mapping_not_found"}, 404
 
-    if not mapping_result.get("found"):
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "mapping_result": mapping_result,
-            "error": "mapping_not_found"
-        }), 404
+    deal_id = mapping["pipedrive_deal_id"]
 
-    deal_id_raw = (mapping_result.get("data") or {}).get("pipedrive_deal_id")
-    try:
-        deal_id = int(deal_id_raw)
-    except Exception:
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "mapping_result": mapping_result,
-            "error": f"invalid_or_missing_pipedrive_deal_id: {deal_id_raw}"
-        }), 500
+    order = fetch_mozello_order(doc_ref)
 
-    try:
-        mozello_result = fetch_mozello_order(doc_ref)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "mapping_result": mapping_result,
-            "error": f"mozello_fetch_failed: {e}"
-        }), 500
+    deal = fetch_pipedrive_deal(deal_id)
 
-    if mozello_result.get("http_status") != 200:
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "mapping_result": mapping_result,
-            "mozello_result": mozello_result,
-            "error": "mozello_order_fetch_non_200"
-        }), 502
+    payload = build_payload(order, deal)
 
-    try:
-        pd_payload = build_payment_update_payload(mozello_result)
-        pipedrive_update = update_pipedrive_deal(deal_id, pd_payload)
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "doc_ref": doc_ref,
-            "deal_id": deal_id,
-            "mapping_result": mapping_result,
-            "mozello_result": mozello_result,
-            "error": f"pipedrive_update_failed: {e}"
-        }), 500
+    result = update_deal(deal_id, payload)
 
-    print(
-        "mozello-sync-worker: process "
-        f"doc_ref={doc_ref} "
-        f"deal_id={deal_id} "
-        f"mapping_found={mapping_result.get('found')} "
-        f"mozello_http_status={mozello_result.get('http_status')} "
-        f"pd_update_ok={pipedrive_update.get('ok')}"
-    )
-
-    status_code = 200 if pipedrive_update.get("ok") else 502
-
-    return jsonify({
-        "ok": bool(pipedrive_update.get("ok")),
+    return {
+        "ok": True,
         "doc_ref": doc_ref,
         "deal_id": deal_id,
-        "received_keys": sorted(list(body.keys())),
-        "mapping_result": mapping_result,
-        "mozello_result": mozello_result,
-        "pipedrive_update": pipedrive_update,
-    }), status_code
+        "payload": payload,
+        "pipedrive_response": result,
+    }
 
 
 if __name__ == "__main__":
