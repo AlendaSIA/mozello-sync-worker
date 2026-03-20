@@ -14,7 +14,7 @@ PIPEDRIVE_BASE_URL = os.getenv("PIPEDRIVE_BASE_URL", "https://api.pipedrive.com"
 
 PAYTRAQ_WEBHOOK_URL = os.getenv(
     "PAYTRAQ_WEBHOOK_URL",
-    "https://go.paytraq.com/ext/webhooks/inbox/986931409704617518"
+    "https://go.paytraq.com/ext/webhooks/inbox/986931409703967629"
 )
 
 # Pipedrive fields
@@ -24,6 +24,8 @@ PD_FIELD_SHIPPING_METHOD = "7f74e6eca96c93d5ecc3cda935f6cf3ead9a60fb"
 PD_FIELD_TRACKING_URL = "fa93f8d95879ea0c0a92f99d9a84fe125e79d3ff"
 PD_FIELD_TRACKING_CODE = "2422006d4620be8a343499abdece3bc9fe6f5b14"
 PD_FIELD_DISPATCH_DATE = "e98a18db6058dca682dd00f3161f665b4b739e88"
+
+FORWARD_TO_PAYTRAQ_EVENTS = {"ORDER_CREATED"}
 
 app = Flask(__name__)
 
@@ -85,6 +87,10 @@ def extract_doc_ref(body: Dict[str, Any]):
                 return v
 
     return ""
+
+
+def should_forward_to_paytraq(event_type: str) -> bool:
+    return _pt(event_type).upper() in FORWARD_TO_PAYTRAQ_EVENTS
 
 
 def forward_to_paytraq_raw(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -183,11 +189,17 @@ def process():
     body = _json_or_form_body()
     event_type = extract_event_type(body)
 
-    paytraq_forward = None
-    try:
-        paytraq_forward = forward_to_paytraq_raw(body)
-    except Exception as e:
-        paytraq_forward = {"ok": False, "error": str(e)}
+    if should_forward_to_paytraq(event_type):
+        try:
+            paytraq_forward = forward_to_paytraq_raw(body)
+        except Exception as e:
+            paytraq_forward = {"ok": False, "error": str(e)}
+    else:
+        paytraq_forward = {
+            "ok": True,
+            "skipped": True,
+            "reason": f"event_not_forwarded:{event_type or 'unknown'}",
+        }
 
     doc_ref = extract_doc_ref(body)
     if not doc_ref:
