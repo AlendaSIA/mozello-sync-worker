@@ -1,4 +1,5 @@
 import os
+import time
 from typing import Any, Dict
 from datetime import datetime
 
@@ -17,6 +18,22 @@ PAYTRAQ_WEBHOOK_URL = os.getenv(
     "https://go.paytraq.com/ext/webhooks/inbox/986931409703967629"
 )
 
+STEP0_TRIGGER_URL = os.getenv(
+    "STEP0_TRIGGER_URL",
+    "https://step0-trigger-142693968214.europe-west1.run.app/run"
+)
+STEP0_TRIGGER_AUDIENCE = os.getenv(
+    "STEP0_TRIGGER_AUDIENCE",
+    "https://step0-trigger-142693968214.europe-west1.run.app"
+)
+
+ORDER_CREATED_WAIT_BEFORE_TRIGGER_SEC = int(
+    os.getenv("ORDER_CREATED_WAIT_BEFORE_TRIGGER_SEC", "90")
+)
+PAYMENT_CHANGED_WAIT_SEC = int(
+    os.getenv("PAYMENT_CHANGED_WAIT_SEC", "180")
+)
+
 # Pipedrive fields
 PD_FIELD_PAYMENT_METHOD = "481737790ef7c52078ce5455742c0a0ad32a0f8e"
 PD_FIELD_PAYMENT_STATUS = "990cd54bfc733795ffc5888156053301245261b7"
@@ -25,7 +42,8 @@ PD_FIELD_TRACKING_URL = "fa93f8d95879ea0c0a92f99d9a84fe125e79d3ff"
 PD_FIELD_TRACKING_CODE = "2422006d4620be8a343499abdece3bc9fe6f5b14"
 PD_FIELD_DISPATCH_DATE = "e98a18db6058dca682dd00f3161f665b4b739e88"
 
-FORWARD_TO_PAYTRAQ_EVENTS = {"ORDER_CREATED"}
+EVENT_ORDER_CREATED = "ORDER_CREATED"
+EVENT_PAYMENT_CHANGED = "PAYMENT_CHANGED"
 
 app = Flask(__name__)
 
@@ -57,13 +75,13 @@ def extract_event_type(body: Dict[str, Any]) -> str:
     for k in ("event", "type", "notification_type"):
         v = _pt(body.get(k))
         if v:
-            return v
+            return v.upper()
 
     if isinstance(body.get("data"), dict):
         for k in ("event", "type", "notification_type"):
             v = _pt(body["data"].get(k))
             if v:
-                return v
+                return v.upper()
 
     return ""
 
@@ -89,10 +107,6 @@ def extract_doc_ref(body: Dict[str, Any]):
     return ""
 
 
-def should_forward_to_paytraq(event_type: str) -> bool:
-    return _pt(event_type).upper() in FORWARD_TO_PAYTRAQ_EVENTS
-
-
 def forward_to_paytraq_raw(body: Dict[str, Any]) -> Dict[str, Any]:
     r = requests.post(
         PAYTRAQ_WEBHOOK_URL,
@@ -103,7 +117,46 @@ def forward_to_paytraq_raw(body: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "ok": r.ok,
         "http_status": r.status_code,
-        "text": r.text[:500],
+        "text": (r.text or "")[:500],
+    }
+
+
+def get_identity_token(audience: str) -> str:
+    metadata_url = (
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/identity"
+    )
+    r = requests.get(
+        metadata_url,
+        params={"audience": audience, "format": "full"},
+        headers={"Metadata-Flavor": "Google"},
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.text.strip()
+
+
+def call_step0_trigger() -> Dict[str, Any]:
+    token = get_identity_token(STEP0_TRIGGER_AUDIENCE)
+    r = requests.post(
+        STEP0_TRIGGER_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json={},
+        timeout=120,
+    )
+
+    preview = None
+    try:
+        preview = r.json()
+    except Exception:
+        preview = {"raw": (r.text or "")[:500]}
+
+    return {
+        "ok": r.ok,
+        "http_status": r.status_code,
+        "response": preview,
     }
 
 
@@ -188,66 +241,128 @@ def health():
 def process():
     body = _json_or_form_body()
     event_type = extract_event_type(body)
-
-    if should_forward_to_paytraq(event_type):
-        try:
-            paytraq_forward = forward_to_paytraq_raw(body)
-        except Exception as e:
-            paytraq_forward = {"ok": False, "error": str(e)}
-    else:
-        paytraq_forward = {
-            "ok": True,
-            "skipped": True,
-            "reason": f"event_not_forwarded:{event_type or 'unknown'}",
-        }
-
     doc_ref = extract_doc_ref(body)
+
+    print("mozello-sync: event_type=", event_type)
+    print("mozello-sync: doc_ref=", doc_ref)
+
     if not doc_ref:
+        print("mozello-sync: missing_doc_ref")
         return {
             "ok": True,
             "skipped": True,
             "reason": "missing_doc_ref",
             "event_type": event_type,
-            "paytraq_forward": paytraq_forward,
         }, 200
 
-    mapping = fetch_mapping(doc_ref)
-    if not mapping:
+    if event_type == EVENT_ORDER_CREATED:
+        print("mozello-sync: ORDER_CREATED -> forward to PayTraq")
+        try:
+            paytraq_forward = forward_to_paytraq_raw(body)
+            print("mozello-sync: paytraq_forward=", paytraq_forward)
+        except Exception as e:
+            print("mozello-sync: paytraq_forward_error=", str(e))
+            return {
+                "ok": False,
+                "event_type": event_type,
+                "doc_ref": doc_ref,
+                "reason": f"paytraq_forward_failed: {e}",
+            }, 500
+
+        print(
+            "mozello-sync: ORDER_CREATED waiting",
+            ORDER_CREATED_WAIT_BEFORE_TRIGGER_SEC,
+            "sec before step0-trigger",
+        )
+        time.sleep(ORDER_CREATED_WAIT_BEFORE_TRIGGER_SEC)
+
+        try:
+            trigger_result = call_step0_trigger()
+            print("mozello-sync: step0_trigger_result=", trigger_result)
+        except Exception as e:
+            print("mozello-sync: step0_trigger_error=", str(e))
+            return {
+                "ok": False,
+                "event_type": event_type,
+                "doc_ref": doc_ref,
+                "paytraq_forward": paytraq_forward,
+                "reason": f"step0_trigger_failed: {e}",
+            }, 500
+
         return {
             "ok": True,
-            "skipped": True,
-            "reason": "mapping_not_found",
-            "doc_ref": doc_ref,
             "event_type": event_type,
+            "doc_ref": doc_ref,
             "paytraq_forward": paytraq_forward,
+            "step0_trigger": trigger_result,
+            "mode": "order_created_forward_then_trigger_only",
         }, 200
 
-    deal_id = mapping["pipedrive_deal_id"]
+    if event_type == EVENT_PAYMENT_CHANGED:
+        print(
+            "mozello-sync: PAYMENT_CHANGED waiting",
+            PAYMENT_CHANGED_WAIT_SEC,
+            "sec before DB/deal update",
+        )
+        time.sleep(PAYMENT_CHANGED_WAIT_SEC)
 
-    try:
-        order = fetch_mozello_order(doc_ref)
-        deal = fetch_pipedrive_deal(deal_id)
-        payload = build_payload(order, deal)
-        result = update_deal(deal_id, payload)
-    except Exception as e:
+        mapping = fetch_mapping(doc_ref)
+        if not mapping:
+            print("mozello-sync: mapping_not_found doc_ref=", doc_ref)
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": "mapping_not_found",
+                "doc_ref": doc_ref,
+                "event_type": event_type,
+            }, 200
+
+        deal_id = mapping["pipedrive_deal_id"]
+        print("mozello-sync: mapping_found doc_ref=", doc_ref, "deal_id=", deal_id)
+
+        try:
+            order = fetch_mozello_order(doc_ref)
+            print(
+                "mozello-sync: mozello_order payment_status=",
+                _pt(order.get("payment_status")),
+                "payment_method=",
+                _pt(order.get("payment_method_details")) or _pt(order.get("payment_method")),
+            )
+
+            deal = fetch_pipedrive_deal(deal_id)
+            payload = build_payload(order, deal)
+            print("mozello-sync: pipedrive_payload=", payload)
+
+            result = update_deal(deal_id, payload)
+            print("mozello-sync: pipedrive_update_done deal_id=", deal_id)
+        except Exception as e:
+            print("mozello-sync: payment_changed_processing_failed=", str(e))
+            return {
+                "ok": True,
+                "skipped": True,
+                "reason": f"payment_changed_processing_failed: {e}",
+                "doc_ref": doc_ref,
+                "deal_id": deal_id,
+                "event_type": event_type,
+            }, 200
+
         return {
             "ok": True,
-            "skipped": True,
-            "reason": f"post_forward_processing_failed: {e}",
+            "event_type": event_type,
             "doc_ref": doc_ref,
             "deal_id": deal_id,
-            "event_type": event_type,
-            "paytraq_forward": paytraq_forward,
+            "payload": payload,
+            "pipedrive_response": result,
+            "mode": "payment_changed_wait_then_update_deal",
         }, 200
 
+    print("mozello-sync: event_ignored event_type=", event_type)
     return {
         "ok": True,
-        "event_type": event_type,
+        "skipped": True,
+        "reason": f"event_ignored:{event_type or 'unknown'}",
         "doc_ref": doc_ref,
-        "deal_id": deal_id,
-        "paytraq_forward": paytraq_forward,
-        "payload": payload,
-        "pipedrive_response": result,
+        "event_type": event_type,
     }, 200
 
 
